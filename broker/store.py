@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Generator
@@ -12,28 +13,34 @@ class Store:
 
     def __init__(self, path: str) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(path)
+        self._lock = threading.RLock()
+        self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self._create_tables()
 
     def close(self) -> None:
-        self.conn.close()
+        with self._lock:
+            self.conn.close()
 
     @contextmanager
     def transaction(self) -> Generator[None, None, None]:
-        if self.conn.in_transaction:
-            yield
-            return
-        self.conn.execute("BEGIN")
+        self._lock.acquire()
         try:
-            yield
-        except Exception:
-            self.conn.rollback()
-            raise
-        else:
-            self.conn.commit()
+            if self.conn.in_transaction:
+                yield
+                return
+            self.conn.execute("BEGIN")
+            try:
+                yield
+            except Exception:
+                self.conn.rollback()
+                raise
+            else:
+                self.conn.commit()
+        finally:
+            self._lock.release()
 
     def _create_tables(self) -> None:
         self.conn.executescript(
@@ -187,20 +194,27 @@ class Store:
             )
 
     def get_job(self, job_id: str) -> Job | None:
-        row = self.conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM jobs WHERE id=?", (job_id,)
+            ).fetchone()
         return self._job(row) if row else None
 
     def get_job_by_key(self, team: str, key: str) -> Job | None:
-        row = self.conn.execute(
-            "SELECT * FROM jobs WHERE team=? AND idempotency_key=?", (team, key)
-        ).fetchone()
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM jobs WHERE team=? AND idempotency_key=?", (team, key)
+            ).fetchone()
         return self._job(row) if row else None
 
     def jobs(self) -> list[Job]:
-        return [self._job(row) for row in self.conn.execute("SELECT * FROM jobs")]
+        with self._lock:
+            rows = self.conn.execute("SELECT * FROM jobs").fetchall()
+        return [self._job(row) for row in rows]
 
     def nodes(self) -> list[Node]:
-        rows = self.conn.execute("SELECT * FROM nodes").fetchall()
+        with self._lock:
+            rows = self.conn.execute("SELECT * FROM nodes").fetchall()
         return [
             Node(
                 id=row["id"],
@@ -269,9 +283,10 @@ class Store:
                 )
 
     def ledger_segments(self) -> list[LedgerSegment]:
-        rows = self.conn.execute(
-            "SELECT node_id,start,end,tenant,gpus_used FROM ledger ORDER BY id"
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT node_id,start,end,tenant,gpus_used FROM ledger ORDER BY id"
+            ).fetchall()
         return [
             LedgerSegment(
                 node_id=row["node_id"],
@@ -284,13 +299,20 @@ class Store:
         ]
 
     def get_meta(self, key: str, default=None):
-        row = self.conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT value FROM meta WHERE key=?", (key,)
+            ).fetchone()
         if row is None:
             return default
         try:
             return json.loads(row["value"])
         except json.JSONDecodeError:
             return row["value"]
+
+    def ping(self) -> None:
+        with self._lock:
+            self.conn.execute("SELECT 1").fetchone()
 
     @staticmethod
     def _job(row: sqlite3.Row) -> Job:

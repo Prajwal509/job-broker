@@ -1,3 +1,5 @@
+import json
+import logging
 import os
 import random
 import uuid
@@ -8,6 +10,8 @@ from .models import Job, JobStatus, Node, NodeState, Priority
 from .provider import CapacityUnavailable, FakeProvider
 from .scheduler import Scheduler
 from .store import Store
+
+event_logger = logging.getLogger("job_broker.events")
 
 
 class ValidationError(ValueError):
@@ -33,6 +37,7 @@ class BrokerConfig:
     max_nodes: int = int(os.environ.get("MAX_NODES", "10"))
     seed: int = int(os.environ.get("SEED", "42"))
     fairness_policy: str = os.environ.get("FAIRNESS_POLICY", "fair")
+    admin_token: str = os.environ.get("ADMIN_TOKEN", "")
 
 
 class Broker:
@@ -104,6 +109,25 @@ class Broker:
             }
         )
 
+    def _log_event(
+        self,
+        event: str,
+        job_id: str | None = None,
+        node_id: str | None = None,
+        timestamp: int | None = None,
+    ) -> None:
+        event_logger.info(
+            json.dumps(
+                {
+                    "time": self.clock.now if timestamp is None else timestamp,
+                    "job_id": job_id,
+                    "node_id": node_id,
+                    "event": event,
+                },
+                separators=(",", ":"),
+            )
+        )
+
     def submit(
         self,
         team: str,
@@ -155,6 +179,7 @@ class Broker:
         with self.store.transaction():
             self.jobs[job.id] = job
             self.store.save_job(job)
+            self._log_event("job_submitted", job_id=job.id)
             self.schedule()
             self._persist_runtime_state()
         return job
@@ -187,6 +212,7 @@ class Broker:
             self._mark_node_idle(node_id, now)
             self.schedule()
             self._persist_runtime_state()
+            self._log_event("job_cancelled", job_id=job.id, node_id=node_id, timestamp=now)
         return job
 
     def finish_job(
@@ -211,6 +237,9 @@ class Broker:
             self._mark_node_idle(node_id, now)
             self.schedule()
             self._persist_runtime_state()
+            self._log_event(
+                f"job_{outcome}", job_id=job.id, node_id=node_id, timestamp=now
+            )
         return job
 
     def advance_to(self, timestamp: int) -> None:
@@ -254,6 +283,7 @@ class Broker:
         self.clock.advance_to(target)
         self._process_due_events()
         self._persist_runtime_state()
+        self._log_event("sim_time_advanced", timestamp=target)
 
     def _process_due_events(self) -> None:
         with self.store.transaction():
@@ -278,6 +308,7 @@ class Broker:
                 node.failure_at = None
                 node.idle_since = now
                 self.store.save_node(node)
+                self._log_event("node_ready", node_id=node.id, timestamp=now)
 
         emptied_node_ids: set[str] = set()
         for job in list(self.jobs.values()):
@@ -295,8 +326,15 @@ class Broker:
                 job.finished_at = now
                 if job.node_id is not None:
                     emptied_node_ids.add(job.node_id)
+                previous_node_id = job.node_id
                 job.node_id = None
                 self.store.save_job(job)
+                self._log_event(
+                    f"job_{job.status.value}",
+                    job_id=job.id,
+                    node_id=previous_node_id,
+                    timestamp=now,
+                )
 
         for node_id in emptied_node_ids:
             self._mark_node_idle(node_id, now)
@@ -367,6 +405,7 @@ class Broker:
                     job.ends_at = self.clock.now + job.actual_minutes * 60
                 self.store.save_job(job)
                 self.store.save_node(node)
+                self._log_event("job_started", job_id=job.id, node_id=node.id)
 
         teams: list[str] = []
         for job in ordered:
@@ -461,6 +500,7 @@ class Broker:
             }
             self.provider.launch_failures += 1
             self._persist_runtime_state()
+            self._log_event("launch_capacity_unavailable", timestamp=now)
             return None
 
         if node_id.startswith("node-") and node_id.removeprefix("node-").isdigit():
@@ -490,6 +530,7 @@ class Broker:
         self.store.save_node(node)
         self._sync_node_segment(node, now)
         self._persist_runtime_state()
+        self._log_event("node_launch_started", node_id=node.id, timestamp=now)
         return node
 
     def _free_gpus(self, node: Node) -> int:
@@ -501,11 +542,19 @@ class Broker:
         return self.NODE_GPUS[node.type] - used
 
     def _terminate_node(self, node: Node, now: int) -> None:
+        launch_failed = node.failure_at is not None and node.failure_at <= now
+        if launch_failed:
+            self.provider.launch_failures += 1
         node.state = NodeState.terminated
         node.terminated_at = now
         self.provider.terminate_node(node.id)
         self.store.save_node(node)
         self._sync_node_segment(node, now)
+        self._log_event(
+            "node_launch_failed" if launch_failed else "node_terminated",
+            node_id=node.id,
+            timestamp=now,
+        )
 
     def _mark_node_idle(self, node_id: str | None, now: int) -> None:
         if node_id is None:
