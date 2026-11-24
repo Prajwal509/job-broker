@@ -1,11 +1,15 @@
 import json
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Generator
 
-from .models import Job, JobStatus, Node, NodeState, Priority
+from .models import Job, JobStatus, LedgerSegment, Node, NodeState, Priority
 
 
 class Store:
+    SCHEMA_VERSION = 1
+
     def __init__(self, path: str) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path)
@@ -16,6 +20,20 @@ class Store:
 
     def close(self) -> None:
         self.conn.close()
+
+    @contextmanager
+    def transaction(self) -> Generator[None, None, None]:
+        if self.conn.in_transaction:
+            yield
+            return
+        self.conn.execute("BEGIN")
+        try:
+            yield
+        except Exception:
+            self.conn.rollback()
+            raise
+        else:
+            self.conn.commit()
 
     def _create_tables(self) -> None:
         self.conn.executescript(
@@ -46,16 +64,18 @@ class Store:
               terminated_at INTEGER,
               tenant TEXT,
               failure_at INTEGER,
-              idle_since INTEGER
+              idle_since INTEGER,
+              last_tenant TEXT
             );
             CREATE TABLE IF NOT EXISTS meta (
               key TEXT PRIMARY KEY,
               value TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS ledger (
+              id INTEGER PRIMARY KEY,
               node_id TEXT NOT NULL,
               start INTEGER NOT NULL,
-              end INTEGER NOT NULL,
+              end INTEGER,
               tenant TEXT,
               gpus_used INTEGER NOT NULL
             );
@@ -76,9 +96,41 @@ class Store:
         if "idle_since" not in node_columns:
             self.conn.execute("ALTER TABLE nodes ADD COLUMN idle_since INTEGER")
             self.conn.commit()
+        if "last_tenant" not in node_columns:
+            self.conn.execute("ALTER TABLE nodes ADD COLUMN last_tenant TEXT")
+            self.conn.commit()
+        ledger_columns = {
+            row["name"]: row
+            for row in self.conn.execute("PRAGMA table_info(ledger)").fetchall()
+        }
+        if "id" not in ledger_columns or ledger_columns["end"]["notnull"]:
+            self.conn.executescript(
+                """
+                ALTER TABLE ledger RENAME TO ledger_old;
+                CREATE TABLE ledger (
+                  id INTEGER PRIMARY KEY,
+                  node_id TEXT NOT NULL,
+                  start INTEGER NOT NULL,
+                  end INTEGER,
+                  tenant TEXT,
+                  gpus_used INTEGER NOT NULL
+                );
+                INSERT INTO ledger(node_id,start,end,tenant,gpus_used)
+                  SELECT node_id,start,end,tenant,gpus_used FROM ledger_old;
+                DROP TABLE ledger_old;
+                """
+            )
+        schema_version = self.get_meta("schema_version")
+        if schema_version is None:
+            self.set_meta("schema_version", self.SCHEMA_VERSION)
+        elif schema_version > self.SCHEMA_VERSION:
+            raise RuntimeError(
+                f"database schema {schema_version} is newer than supported "
+                f"schema {self.SCHEMA_VERSION}"
+            )
 
     def save_job(self, job: Job) -> None:
-        with self.conn:
+        with self.transaction():
             self.conn.execute(
                 """INSERT INTO jobs (
                    id, team, gpus, estimated_minutes, priority, idempotency_key,
@@ -109,16 +161,17 @@ class Store:
             )
 
     def save_node(self, node: Node) -> None:
-        with self.conn:
+        with self.transaction():
             self.conn.execute(
                 """INSERT INTO nodes (
                    id, type, state, launched_at, ready_at, terminated_at, tenant, failure_at
-                   , idle_since
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   , idle_since, last_tenant
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(id) DO UPDATE SET
                    state=excluded.state, ready_at=excluded.ready_at,
                    terminated_at=excluded.terminated_at, tenant=excluded.tenant,
-                   failure_at=excluded.failure_at, idle_since=excluded.idle_since""",
+                   failure_at=excluded.failure_at, idle_since=excluded.idle_since,
+                   last_tenant=excluded.last_tenant""",
                 (
                     node.id,
                     node.type,
@@ -129,6 +182,7 @@ class Store:
                     node.tenant,
                     node.failure_at,
                     node.idle_since,
+                    node.last_tenant,
                 ),
             )
 
@@ -158,18 +212,76 @@ class Store:
                 tenant=row["tenant"],
                 failure_at=row["failure_at"],
                 idle_since=row["idle_since"] if "idle_since" in row.keys() else None,
+                last_tenant=row["last_tenant"] if "last_tenant" in row.keys() else None,
             )
             for row in rows
         ]
 
     def set_meta(self, key: str, value) -> None:
         encoded = json.dumps(value) if not isinstance(value, str) else value
-        with self.conn:
-            self.conn.execute(
-                "INSERT INTO meta(key,value) VALUES (?,?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (key, encoded),
+        self.set_meta_values({key: encoded}, encoded=True)
+
+    def set_meta_values(self, values: dict[str, object], encoded: bool = False) -> None:
+        with self.transaction():
+            for key, value in values.items():
+                stored = (
+                    value
+                    if encoded and isinstance(value, str)
+                    else json.dumps(value)
+                )
+                self.conn.execute(
+                    "INSERT INTO meta(key,value) VALUES (?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, stored),
+                )
+
+    def sync_ledger_segment(
+        self,
+        node_id: str,
+        timestamp: int,
+        tenant: str | None,
+        gpus_used: int,
+        active: bool,
+    ) -> None:
+        with self.transaction():
+            row = self.conn.execute(
+                "SELECT id,tenant,gpus_used FROM ledger "
+                "WHERE node_id=? AND end IS NULL ORDER BY id DESC LIMIT 1",
+                (node_id,),
+            ).fetchone()
+            if (
+                active
+                and row is not None
+                and row["tenant"] == tenant
+                and row["gpus_used"] == gpus_used
+            ):
+                return
+            if row is not None:
+                self.conn.execute(
+                    "UPDATE ledger SET end=? WHERE id=?",
+                    (timestamp, row["id"]),
+                )
+            if active:
+                self.conn.execute(
+                    "INSERT INTO ledger(node_id,start,end,tenant,gpus_used) "
+                    "VALUES (?,?,NULL,?,?)",
+                    (node_id, timestamp, tenant, gpus_used),
+                )
+
+    def ledger_segments(self) -> list[LedgerSegment]:
+        rows = self.conn.execute(
+            "SELECT node_id,start,end,tenant,gpus_used FROM ledger ORDER BY id"
+        ).fetchall()
+        return [
+            LedgerSegment(
+                node_id=row["node_id"],
+                start=row["start"],
+                end=row["end"],
+                tenant=row["tenant"],
+                gpus_used=row["gpus_used"],
             )
+            for row in rows
+        ]
 
     def get_meta(self, key: str, default=None):
         row = self.conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()

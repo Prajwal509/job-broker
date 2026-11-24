@@ -103,7 +103,10 @@ def test_tenant_isolation(tmp_path):
     broker = make_broker(tmp_path)
     randomizer = random.Random(2025)
 
-    class ReliableRng:
+    class ReliableRng(random.Random):
+        def __init__(self):
+            super().__init__(0)
+
         def random(self):
             return 0.5
 
@@ -176,8 +179,11 @@ def test_capacity_outage_resilience(tmp_path):
 def test_launch_failure_and_reaper(tmp_path):
     broker = make_broker(tmp_path)
 
-    class ForcedLaunchFailureRng:
+    class ForcedLaunchFailureRng(random.Random):
         values = iter((0.5, 0.0, 0.5, 0.5))
+
+        def __init__(self):
+            super().__init__(0)
 
         def random(self):
             return next(self.values)
@@ -221,7 +227,10 @@ def test_never_ready_launch_has_no_ready_time():
 def test_node_ids_are_monotonic_and_terminated_rows_are_preserved(tmp_path):
     broker = make_broker(tmp_path)
 
-    class ReliableRng:
+    class ReliableRng(random.Random):
+        def __init__(self):
+            super().__init__(0)
+
         def random(self):
             return 0.5
 
@@ -328,7 +337,10 @@ def test_due_launch_retry_is_dropped_when_queue_is_empty(tmp_path):
 def test_large_team_queue_launches_for_uncovered_demand(tmp_path):
     broker = make_broker(tmp_path)
 
-    class ReliableRng:
+    class ReliableRng(random.Random):
+        def __init__(self):
+            super().__init__(0)
+
         def random(self):
             return 0.5
 

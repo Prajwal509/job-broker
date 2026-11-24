@@ -51,3 +51,13 @@ class Node:
     tenant: str | None = None
     failure_at: int | None = None
     idle_since: int | None = None
+    last_tenant: str | None = None
+
+
+@dataclass(frozen=True)
+class LedgerSegment:
+    node_id: str
+    start: int
+    end: int | None
+    tenant: str | None
+    gpus_used: int

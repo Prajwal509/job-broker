@@ -57,4 +57,26 @@ class FakeProvider:
         return self.rng.getstate()
 
     def set_rng_state(self, state: tuple) -> None:
-        self.rng.setstate(state)
+        self.rng.setstate(self._tuple_state(state))
+
+    def export_state(self) -> dict:
+        return {
+            "rng_state": self.rng_state(),
+            "outage_until": self.outage_until,
+            "alive": sorted(self.alive),
+            "launch_failures": self.launch_failures,
+            "last_node_number": self.last_node_number,
+        }
+
+    def restore_state(self, state: dict) -> None:
+        self.set_rng_state(state["rng_state"])
+        self.outage_until = state["outage_until"]
+        self.alive = set(state["alive"])
+        self.launch_failures = state["launch_failures"]
+        self.last_node_number = state["last_node_number"]
+
+    @classmethod
+    def _tuple_state(cls, value):
+        if isinstance(value, list):
+            return tuple(cls._tuple_state(item) for item in value)
+        return value

@@ -52,11 +52,23 @@ class Broker:
         self.provider = provider or FakeProvider(self.config.seed, self.clock)
         self.provider.set_clock(self.clock)
         self.scheduler = Scheduler(self.config.fairness_policy)
-        self.backoff: dict[str, dict[str, int]] = {}
-        self.retry_count: dict[str, int] = {t: 0 for t in self.NODE_TYPES}
-        self.next_reaper = self.clock.now
         self.jobs: dict[str, Job] = {j.id: j for j in self.store.jobs()}
         self.nodes: dict[str, Node] = {n.id: n for n in self.store.nodes()}
+        runtime = self.store.get_meta("runtime", {})
+        self.backoff: dict[str, dict[str, int]] = runtime.get("backoff", {})
+        self.retry_count: dict[str, int] = {
+            t: 0 for t in self.NODE_TYPES
+        } | runtime.get("retry_count", {})
+        self.next_reaper = int(runtime.get("next_reaper", self.clock.now))
+        provider_state = runtime.get("provider")
+        if provider_state and hasattr(self.provider, "restore_state"):
+            self.provider.restore_state(provider_state)
+        if hasattr(self.provider, "alive"):
+            self.provider.alive = {
+                node.id
+                for node in self.nodes.values()
+                if node.state != NodeState.terminated
+            }
         stored_counter = int(self.store.get_meta("node_id_counter", 0))
         existing_counter = max(
             (
@@ -69,6 +81,28 @@ class Broker:
         self.node_id_counter = max(stored_counter, existing_counter)
         if hasattr(self.provider, "last_node_number"):
             self.provider.last_node_number = self.node_id_counter
+        for node in self.nodes.values():
+            if node.last_tenant is None:
+                node.last_tenant = node.tenant
+        self._persist_runtime_state()
+
+    def _persist_runtime_state(self) -> None:
+        export_state = getattr(self.provider, "export_state", None)
+        provider_state = export_state() if export_state is not None else {
+            "launch_failures": getattr(self.provider, "launch_failures", 0),
+        }
+        self.store.set_meta_values(
+            {
+                "clock": self.clock.now,
+                "node_id_counter": self.node_id_counter,
+                "runtime": {
+                    "backoff": self.backoff,
+                    "retry_count": self.retry_count,
+                    "next_reaper": self.next_reaper,
+                    "provider": provider_state,
+                },
+            }
+        )
 
     def submit(
         self,
@@ -118,10 +152,11 @@ class Broker:
         )
         if actual_minutes is not None:
             job.ends_at = self.clock.now + actual_minutes * 60
-        self.jobs[job.id] = job
-        self.store.save_job(job)
-        self.store.set_meta("clock", self.clock.now)
-        self.schedule()
+        with self.store.transaction():
+            self.jobs[job.id] = job
+            self.store.save_job(job)
+            self.schedule()
+            self._persist_runtime_state()
         return job
 
     def get_job(self, job_id: str) -> Job:
@@ -142,14 +177,16 @@ class Broker:
             raise ConflictError("terminal job cannot be cancelled")
         now = self.clock.now if now is None else now
         node_id = job.node_id
-        job.status = JobStatus.cancelled
-        job.finished_at = now
-        job.ends_at = now
-        job.outcome = "cancelled"
-        job.node_id = None
-        self.store.save_job(job)
-        self._mark_node_idle(node_id, now)
-        self.schedule()
+        with self.store.transaction():
+            job.status = JobStatus.cancelled
+            job.finished_at = now
+            job.ends_at = now
+            job.outcome = "cancelled"
+            job.node_id = None
+            self.store.save_job(job)
+            self._mark_node_idle(node_id, now)
+            self.schedule()
+            self._persist_runtime_state()
         return job
 
     def finish_job(
@@ -164,14 +201,16 @@ class Broker:
             raise ValidationError("invalid job outcome")
         now = self.clock.now if now is None else now
         node_id = job.node_id
-        job.status = JobStatus(outcome)
-        job.finished_at = now
-        job.ends_at = now
-        job.outcome = outcome
-        job.node_id = None
-        self.store.save_job(job)
-        self._mark_node_idle(node_id, now)
-        self.schedule()
+        with self.store.transaction():
+            job.status = JobStatus(outcome)
+            job.finished_at = now
+            job.ends_at = now
+            job.outcome = outcome
+            job.node_id = None
+            self.store.save_job(job)
+            self._mark_node_idle(node_id, now)
+            self.schedule()
+            self._persist_runtime_state()
         return job
 
     def advance_to(self, timestamp: int) -> None:
@@ -210,14 +249,17 @@ class Broker:
                 break
             self.clock.advance_to(min(due))
             self._process_due_events()
-            self.store.set_meta("clock", self.clock.now)
+            self._persist_runtime_state()
 
         self.clock.advance_to(target)
         self._process_due_events()
-        self.schedule()
-        self.store.set_meta("clock", self.clock.now)
+        self._persist_runtime_state()
 
     def _process_due_events(self) -> None:
+        with self.store.transaction():
+            self._process_due_events_in_transaction()
+
+    def _process_due_events_in_transaction(self) -> None:
         now = self.clock.now
 
         for node in list(self.nodes.values()):
@@ -280,12 +322,18 @@ class Broker:
             self.backoff.pop(type_name)
 
         self.schedule()
+        self._persist_runtime_state()
 
     def schedule(self) -> None:
+        with self.store.transaction():
+            self._schedule_in_transaction()
+
+    def _schedule_in_transaction(self) -> None:
         for node in self.nodes.values():
             if (
                 node.state == NodeState.ready
                 and self._free_gpus(node) == self.NODE_GPUS[node.type]
+                and node.tenant is not None
             ):
                 node.tenant = None
                 self.store.save_node(node)
@@ -310,6 +358,7 @@ class Broker:
                     ),
                 )
                 node.tenant = job.team
+                node.last_tenant = job.team
                 job.status = JobStatus.running
                 job.started_at = self.clock.now
                 job.node_id = node.id
@@ -364,6 +413,8 @@ class Broker:
                         break
             if not launched:
                 break
+        self._sync_all_segments(self.clock.now)
+        self._persist_runtime_state()
 
     def _alive_node_count(self) -> int:
         return sum(
@@ -389,6 +440,12 @@ class Broker:
     def _launch_one(
         self, node_type: str, now: int, tenant: str | None = None
     ) -> Node | None:
+        with self.store.transaction():
+            return self._launch_one_in_transaction(node_type, now, tenant)
+
+    def _launch_one_in_transaction(
+        self, node_type: str, now: int, tenant: str | None
+    ) -> Node | None:
         try:
             node_id = self.provider.launch_node(node_type, now)
             details = self.provider.launch_details(node_id, node_type, now)
@@ -403,6 +460,7 @@ class Broker:
                 "failures": failures,
             }
             self.provider.launch_failures += 1
+            self._persist_runtime_state()
             return None
 
         if node_id.startswith("node-") and node_id.removeprefix("node-").isdigit():
@@ -419,15 +477,19 @@ class Broker:
             ready_at=details.ready_at,
             tenant=tenant,
             failure_at=details.failure_at,
+            last_tenant=tenant,
         )
         queued = [j for j in self.jobs.values() if j.status == JobStatus.queued]
         if tenant is None and queued:
             ordered = self.scheduler.queue_order(queued, self._rolling_usage(), now)
             node.tenant = ordered[0].team
+            node.last_tenant = node.tenant
         self.retry_count[node_type] = 0
         self.backoff.pop(node_type, None)
         self.nodes[node.id] = node
         self.store.save_node(node)
+        self._sync_node_segment(node, now)
+        self._persist_runtime_state()
         return node
 
     def _free_gpus(self, node: Node) -> int:
@@ -443,6 +505,7 @@ class Broker:
         node.terminated_at = now
         self.provider.terminate_node(node.id)
         self.store.save_node(node)
+        self._sync_node_segment(node, now)
 
     def _mark_node_idle(self, node_id: str | None, now: int) -> None:
         if node_id is None:
@@ -459,6 +522,21 @@ class Broker:
             node.idle_since = now
             node.tenant = None
             self.store.save_node(node)
+            self._sync_node_segment(node, now)
+
+    def _sync_node_segment(self, node: Node, timestamp: int) -> None:
+        used = self.NODE_GPUS[node.type] - self._free_gpus(node)
+        self.store.sync_ledger_segment(
+            node_id=node.id,
+            timestamp=timestamp,
+            tenant=node.tenant or node.last_tenant,
+            gpus_used=used,
+            active=node.state != NodeState.terminated,
+        )
+
+    def _sync_all_segments(self, timestamp: int) -> None:
+        for node in self.nodes.values():
+            self._sync_node_segment(node, timestamp)
 
     def _run_reaper(self, now: int) -> None:
         timeout = self.config.idle_timeout_minutes * 60
