@@ -7,7 +7,7 @@ lint:
 	ruff check broker tests api.py
 
 test:
-	pytest -q
+	python -m pytest -q
 
 run:
 	python -m uvicorn api:app --reload

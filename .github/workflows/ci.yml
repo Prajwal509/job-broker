@@ -18,7 +18,7 @@ jobs:
           cache: pip
       - run: python -m pip install -r requirements.txt
       - run: ruff check broker tests api.py
-      - run: pytest -q
+      - run: python -m pytest -q
       - run: head -n 11 data/01a_trace.csv > /tmp/job-broker-slice.csv
       - run: python -m broker.trace replay --trace /tmp/job-broker-slice.csv --policy fair --seed 42 --out out >/dev/null
       - run: python -c "import json; d=json.load(open('out/fair-42-10m.json')); c=d['cost']; assert round(sum(t['total_cost'] for t in c['teams'].values()) + c['platform_cost'], 2) == c['total_cost']"

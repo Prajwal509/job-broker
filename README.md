@@ -8,7 +8,7 @@ attribution, trace replay, and a FastAPI control plane.
 ```sh
 python3.11 -m venv .venv && source .venv/bin/activate
 python -m pip install -r requirements.txt
-pytest -q
+python -m pytest -q
 python -m broker.trace replay --trace data/01a_trace.csv --policy fair --seed 42 --out out
 export ADMIN_TOKEN=dev-secret && python -m uvicorn api:app --host 0.0.0.0 --port 8000
 ```
