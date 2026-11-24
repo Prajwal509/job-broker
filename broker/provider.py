@@ -9,7 +9,7 @@ class CapacityUnavailable(Exception):
 @dataclass(frozen=True)
 class ProviderLaunch:
     node_id: str
-    ready_at: int
+    ready_at: int | None
     failure_at: int | None
 
 
@@ -23,6 +23,7 @@ class FakeProvider:
         self.outage_until: int = 0
         self.alive: set[str] = set()
         self.launch_failures = 0
+        self.last_node_number = 0
 
     def set_clock(self, clock) -> None:
         self.clock = clock
@@ -35,11 +36,8 @@ class FakeProvider:
             self.outage_until = now + self.rng.randint(10 * 60, 30 * 60)
             raise CapacityUnavailable("outage started")
 
-        number = len(self.alive) + 1
-        node_id = f"node-{number}"
-        while node_id in self.alive:
-            number += 1
-            node_id = f"node-{number}"
+        self.last_node_number += 1
+        node_id = f"node-{self.last_node_number}"
         self.alive.add(node_id)
         return node_id
 
@@ -47,10 +45,10 @@ class FakeProvider:
         self, node_id: str, node_type: str, now: int
     ) -> ProviderLaunch:
         ready_delay = self.rng.randint(4 * 60, 8 * 60)
-        failure_at = None
-        if self.rng.random() < 0.03:
-            failure_at = now + 15 * 60
-        return ProviderLaunch(node_id, now + ready_delay, failure_at)
+        never_ready = self.rng.random() < 0.03
+        failure_at = now + 15 * 60 if never_ready else None
+        ready_at = None if never_ready else now + ready_delay
+        return ProviderLaunch(node_id, ready_at, failure_at)
 
     def terminate_node(self, node_id: str) -> None:
         self.alive.discard(node_id)

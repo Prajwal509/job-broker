@@ -45,7 +45,8 @@ class Store:
               ready_at INTEGER,
               terminated_at INTEGER,
               tenant TEXT,
-              failure_at INTEGER
+              failure_at INTEGER,
+              idle_since INTEGER
             );
             CREATE TABLE IF NOT EXISTS meta (
               key TEXT PRIMARY KEY,
@@ -67,6 +68,13 @@ class Store:
         }
         if "node_id" not in job_columns:
             self.conn.execute("ALTER TABLE jobs ADD COLUMN node_id TEXT")
+            self.conn.commit()
+        node_columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(nodes)").fetchall()
+        }
+        if "idle_since" not in node_columns:
+            self.conn.execute("ALTER TABLE nodes ADD COLUMN idle_since INTEGER")
             self.conn.commit()
 
     def save_job(self, job: Job) -> None:
@@ -105,11 +113,12 @@ class Store:
             self.conn.execute(
                 """INSERT INTO nodes (
                    id, type, state, launched_at, ready_at, terminated_at, tenant, failure_at
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   , idle_since
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(id) DO UPDATE SET
                    state=excluded.state, ready_at=excluded.ready_at,
                    terminated_at=excluded.terminated_at, tenant=excluded.tenant,
-                   failure_at=excluded.failure_at""",
+                   failure_at=excluded.failure_at, idle_since=excluded.idle_since""",
                 (
                     node.id,
                     node.type,
@@ -119,6 +128,7 @@ class Store:
                     node.terminated_at,
                     node.tenant,
                     node.failure_at,
+                    node.idle_since,
                 ),
             )
 
@@ -147,6 +157,7 @@ class Store:
                 terminated_at=row["terminated_at"],
                 tenant=row["tenant"],
                 failure_at=row["failure_at"],
+                idle_since=row["idle_since"] if "idle_since" in row.keys() else None,
             )
             for row in rows
         ]

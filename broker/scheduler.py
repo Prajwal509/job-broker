@@ -1,4 +1,4 @@
-from .models import Job, JobStatus, Node, NodeState, Priority
+from .models import Job, JobStatus, Priority
 
 
 class Scheduler:
@@ -11,7 +11,11 @@ class Scheduler:
         if self.policy == "fifo":
             return sorted(
                 queued,
-                key=lambda j: (self.priority_rank[j.priority.value], j.submitted_at, j.id),
+                key=lambda j: (
+                    -self.priority_rank[j.priority.value],
+                    j.submitted_at,
+                    j.id,
+                ),
             )
 
         def effective_priority(job: Job) -> int:
@@ -20,46 +24,26 @@ class Scheduler:
                 rank += 1
             return min(rank, 2)
 
-        return sorted(
-            queued,
-            key=lambda j: (
-                -effective_priority(j),
-                usage.get(j.team, 0.0),
-                j.submitted_at,
-                j.id,
-            ),
-        )
+        tiers: dict[int, list[Job]] = {}
+        for job in queued:
+            tiers.setdefault(effective_priority(job), []).append(job)
 
-    def place_jobs(
-        self, jobs: list[Job], nodes: list[Node], now: int
-    ) -> tuple[list[Job], list[Node]]:
-        usage: dict[str, float] = {}
-        for node in nodes:
-            if node.tenant:
-                usage[node.tenant] = usage.get(node.tenant, 0.0)
-        for job in self.queue_order(jobs, usage, now):
-            candidates = [
-                n
-                for n in nodes
-                if n.state == NodeState.ready
-                and n.tenant in (None, job.team)
-                and self.free_gpus(n, jobs) >= job.gpus
-            ]
-            if candidates:
-                node = min(candidates, key=lambda n: (n.tenant is None, self.free_gpus(n, jobs)))
-                node.tenant = job.team
-                job.status = JobStatus.running
-                job.started_at = now
-                job.node_id = node.id
-        return jobs, nodes
+        ordered: list[Job] = []
+        for tier in sorted(tiers, reverse=True):
+            team_jobs: dict[str, list[Job]] = {}
+            for job in sorted(tiers[tier], key=lambda j: (j.submitted_at, j.id)):
+                team_jobs.setdefault(job.team, []).append(job)
+            teams = sorted(
+                team_jobs,
+                key=lambda team: (
+                    usage.get(team, 0.0),
+                    team_jobs[team][0].submitted_at,
+                    team,
+                ),
+            )
+            while any(team_jobs.values()):
+                for team in teams:
+                    if team_jobs[team]:
+                        ordered.append(team_jobs[team].pop(0))
+        return ordered
 
-    @staticmethod
-    def free_gpus(node: Node, jobs: list[Job]) -> int:
-        capacities = {"gpu-s": 1, "gpu-m": 4, "gpu-l": 8}
-        running = sum(
-            j.gpus
-            for j in jobs
-            if j.status == JobStatus.running
-            and j.node_id == node.id
-        )
-        return capacities[node.type] - running

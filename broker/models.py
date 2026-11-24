@@ -50,3 +50,4 @@ class Node:
     terminated_at: int | None = None
     tenant: str | None = None
     failure_at: int | None = None
+    idle_since: int | None = None

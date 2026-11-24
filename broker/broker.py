@@ -57,6 +57,18 @@ class Broker:
         self.next_reaper = self.clock.now
         self.jobs: dict[str, Job] = {j.id: j for j in self.store.jobs()}
         self.nodes: dict[str, Node] = {n.id: n for n in self.store.nodes()}
+        stored_counter = int(self.store.get_meta("node_id_counter", 0))
+        existing_counter = max(
+            (
+                int(node_id.removeprefix("node-"))
+                for node_id in self.nodes
+                if node_id.startswith("node-") and node_id.removeprefix("node-").isdigit()
+            ),
+            default=0,
+        )
+        self.node_id_counter = max(stored_counter, existing_counter)
+        if hasattr(self.provider, "last_node_number"):
+            self.provider.last_node_number = self.node_id_counter
 
     def submit(
         self,
@@ -71,7 +83,7 @@ class Broker:
         if not isinstance(team, str) or not team.strip():
             raise ValidationError("team must be a non-empty string")
         team = team.strip()
-        if gpus not in {1, 2, 4, 8}:
+        if isinstance(gpus, bool) or gpus not in {1, 2, 4, 8}:
             raise ValidationError("gpus must be one of 1, 2, 4, 8")
         if estimated_minutes <= 0:
             raise ValidationError("estimated_minutes must be positive")
@@ -129,12 +141,14 @@ class Broker:
         }:
             raise ConflictError("terminal job cannot be cancelled")
         now = self.clock.now if now is None else now
+        node_id = job.node_id
         job.status = JobStatus.cancelled
         job.finished_at = now
         job.ends_at = now
         job.outcome = "cancelled"
         job.node_id = None
         self.store.save_job(job)
+        self._mark_node_idle(node_id, now)
         self.schedule()
         return job
 
@@ -149,12 +163,14 @@ class Broker:
         if outcome not in {"succeeded", "failed", "cancelled"}:
             raise ValidationError("invalid job outcome")
         now = self.clock.now if now is None else now
+        node_id = job.node_id
         job.status = JobStatus(outcome)
         job.finished_at = now
         job.ends_at = now
         job.outcome = outcome
         job.node_id = None
         self.store.save_job(job)
+        self._mark_node_idle(node_id, now)
         self.schedule()
         return job
 
@@ -175,6 +191,13 @@ class Broker:
                 if job.status == JobStatus.running and job.ends_at is not None:
                     event_times.append(job.ends_at)
 
+            timeout = self.config.idle_timeout_minutes * 60
+            for node in self.nodes.values():
+                if node.state == NodeState.ready and node.idle_since is not None:
+                    event_times.append(
+                        max(node.idle_since + timeout + 1, node.launched_at + 600)
+                    )
+
             for type_name, retry in self.backoff.items():
                 if retry["next"] > 0:
                     event_times.append(retry["next"])
@@ -190,7 +213,6 @@ class Broker:
             self.store.set_meta("clock", self.clock.now)
 
         self.clock.advance_to(target)
-        self.next_reaper = min(self.next_reaper or target, target)
         self._process_due_events()
         self.schedule()
         self.store.set_meta("clock", self.clock.now)
@@ -212,8 +234,10 @@ class Broker:
             ):
                 node.state = NodeState.ready
                 node.failure_at = None
+                node.idle_since = now
                 self.store.save_node(node)
 
+        emptied_node_ids: set[str] = set()
         for job in list(self.jobs.values()):
             if (
                 job.status == JobStatus.running
@@ -227,26 +251,45 @@ class Broker:
                 else:
                     job.status = JobStatus.succeeded
                 job.finished_at = now
+                if job.node_id is not None:
+                    emptied_node_ids.add(job.node_id)
                 job.node_id = None
                 self.store.save_job(job)
 
-        if now >= self.next_reaper:
+        for node_id in emptied_node_ids:
+            self._mark_node_idle(node_id, now)
+
+        reaper_deadline_due = any(
+            node.state == NodeState.ready
+            and node.idle_since is not None
+            and now >= max(
+                node.idle_since + self.config.idle_timeout_minutes * 60 + 1,
+                node.launched_at + 600,
+            )
+            for node in self.nodes.values()
+        )
+        if now >= self.next_reaper or reaper_deadline_due:
             self._run_reaper(now)
             self.next_reaper = now + 60
 
-        retry_types = [
+        for type_name in [
             t
             for t, retry in self.backoff.items()
             if retry["next"] > 0 and retry["next"] <= now
-        ]
-        for type_name in retry_types:
-            retry = self.backoff[type_name]
-            retry["next"] = 0
-            self._launch_one(type_name, now)
+        ]:
+            self.backoff.pop(type_name)
 
         self.schedule()
 
     def schedule(self) -> None:
+        for node in self.nodes.values():
+            if (
+                node.state == NodeState.ready
+                and self._free_gpus(node) == self.NODE_GPUS[node.type]
+            ):
+                node.tenant = None
+                self.store.save_node(node)
+
         usage = self._rolling_usage()
         ordered = self.scheduler.queue_order(list(self.jobs.values()), usage, self.clock.now)
 
@@ -270,56 +313,71 @@ class Broker:
                 job.status = JobStatus.running
                 job.started_at = self.clock.now
                 job.node_id = node.id
+                node.idle_since = None
                 if job.actual_minutes is not None:
                     job.ends_at = self.clock.now + job.actual_minutes * 60
                 self.store.save_job(job)
                 self.store.save_node(node)
 
+        teams: list[str] = []
         for job in ordered:
-            if job.status != JobStatus.queued:
-                continue
-            if self._launch_duplicate_would_fit(job):
-                continue
-            if sum(
-                1
-                for node in self.nodes.values()
-                if node.state in (NodeState.launching, NodeState.ready)
-            ) >= self.config.max_nodes:
-                continue
+            if job.status == JobStatus.queued and job.team not in teams:
+                teams.append(job.team)
 
-            node_type = self._smallest_type_for(job)
-            team_demand = sum(
-                j.gpus
-                for j in ordered
-                if j.team == job.team and j.status == JobStatus.queued
-            )
-            if team_demand >= 8:
-                node_type = "gpu-l"
-            elif team_demand >= 4:
-                node_type = "gpu-m"
-            if job.gpus > self.NODE_GPUS[node_type]:
-                continue
-
-            retry = self.backoff.get(node_type)
-            if retry and retry["next"] > self.clock.now:
-                for larger in self.NODE_TYPES[self.NODE_TYPES.index(node_type) + 1 :]:
-                    larger_retry = self.backoff.get(larger)
-                    if not larger_retry or larger_retry["next"] <= self.clock.now:
-                        node_type = larger
-                        break
-                else:
+        while self._alive_node_count() < self.config.max_nodes:
+            launched = False
+            for team in teams:
+                team_jobs = [
+                    job
+                    for job in ordered
+                    if job.team == team and job.status == JobStatus.queued
+                ]
+                demand = sum(job.gpus for job in team_jobs)
+                covered = sum(
+                    self._free_gpus(node)
+                    for node in self.nodes.values()
+                    if node.state == NodeState.ready and node.tenant in (None, team)
+                )
+                covered += sum(
+                    self.NODE_GPUS[node.type]
+                    for node in self.nodes.values()
+                    if node.state == NodeState.launching and node.tenant == team
+                )
+                if demand <= covered:
                     continue
-            self._launch_one(node_type, self.clock.now)
 
-    def _launch_duplicate_would_fit(self, job: Job) -> bool:
-        for node in self.nodes.values():
-            if (
-                node.state == NodeState.launching
-                and node.tenant == job.team
-                and self.NODE_GPUS[node.type] >= job.gpus
-            ):
-                return True
-        return False
+                largest_job = max(team_jobs, key=lambda job: job.gpus)
+                node_type = self._smallest_type_for(largest_job)
+                if demand >= 8:
+                    node_type = "gpu-l"
+                elif demand >= 4 and node_type == "gpu-s":
+                    node_type = "gpu-m"
+                elif demand > self.NODE_GPUS[node_type]:
+                    index = self.NODE_TYPES.index(node_type)
+                    node_type = self.NODE_TYPES[min(index + 1, len(self.NODE_TYPES) - 1)]
+                node_type = self._type_outside_backoff(node_type)
+                if node_type is None:
+                    continue
+                if self._launch_one(node_type, self.clock.now, team) is not None:
+                    launched = True
+                    if self._alive_node_count() >= self.config.max_nodes:
+                        break
+            if not launched:
+                break
+
+    def _alive_node_count(self) -> int:
+        return sum(
+            node.state in (NodeState.launching, NodeState.ready)
+            for node in self.nodes.values()
+        )
+
+    def _type_outside_backoff(self, node_type: str) -> str | None:
+        first = self.NODE_TYPES.index(node_type)
+        for candidate in self.NODE_TYPES[first:]:
+            retry = self.backoff.get(candidate)
+            if retry is None or retry["next"] <= self.clock.now:
+                return candidate
+        return None
 
     def _smallest_type_for(self, job: Job) -> str:
         if job.gpus <= 1:
@@ -328,7 +386,9 @@ class Broker:
             return "gpu-m"
         return "gpu-l"
 
-    def _launch_one(self, node_type: str, now: int) -> Node | None:
+    def _launch_one(
+        self, node_type: str, now: int, tenant: str | None = None
+    ) -> Node | None:
         try:
             node_id = self.provider.launch_node(node_type, now)
             details = self.provider.launch_details(node_id, node_type, now)
@@ -345,21 +405,23 @@ class Broker:
             self.provider.launch_failures += 1
             return None
 
+        if node_id.startswith("node-") and node_id.removeprefix("node-").isdigit():
+            self.node_id_counter = max(
+                self.node_id_counter, int(node_id.removeprefix("node-"))
+            )
+            self.store.set_meta("node_id_counter", self.node_id_counter)
+
         node = Node(
             id=node_id,
             type=node_type,
             state=NodeState.launching,
             launched_at=now,
             ready_at=details.ready_at,
-            tenant=self._tenant_for_new_node(),
+            tenant=tenant,
             failure_at=details.failure_at,
         )
-        queued = [
-            j
-            for j in self.jobs.values()
-            if j.status == JobStatus.queued
-        ]
-        if queued:
+        queued = [j for j in self.jobs.values() if j.status == JobStatus.queued]
+        if tenant is None and queued:
             ordered = self.scheduler.queue_order(queued, self._rolling_usage(), now)
             node.tenant = ordered[0].team
         self.retry_count[node_type] = 0
@@ -367,9 +429,6 @@ class Broker:
         self.nodes[node.id] = node
         self.store.save_node(node)
         return node
-
-    def _tenant_for_new_node(self) -> str | None:
-        return None
 
     def _free_gpus(self, node: Node) -> int:
         used = sum(
@@ -385,12 +444,28 @@ class Broker:
         self.provider.terminate_node(node.id)
         self.store.save_node(node)
 
+    def _mark_node_idle(self, node_id: str | None, now: int) -> None:
+        if node_id is None:
+            return
+        node = self.nodes.get(node_id)
+        if (
+            node is not None
+            and node.state == NodeState.ready
+            and not any(
+                job.status == JobStatus.running and job.node_id == node_id
+                for job in self.jobs.values()
+            )
+        ):
+            node.idle_since = now
+            node.tenant = None
+            self.store.save_node(node)
+
     def _run_reaper(self, now: int) -> None:
         timeout = self.config.idle_timeout_minutes * 60
         for node in list(self.nodes.values()):
             if node.state != NodeState.ready or self._free_gpus(node) != self.NODE_GPUS[node.type]:
                 continue
-            if node.ready_at is None or now - node.ready_at < timeout:
+            if node.idle_since is None or now - node.idle_since <= timeout:
                 continue
             if now - node.launched_at < 600:
                 continue
@@ -407,6 +482,17 @@ class Broker:
         usage: dict[str, float] = {}
         cutoff = self.clock.now - 24 * 60 * 60
         for job in self.jobs.values():
-            if job.started_at is not None and job.started_at >= cutoff:
-                usage[job.team] = usage.get(job.team, 0.0) + job.gpus
+            if job.started_at is None:
+                continue
+            if job.finished_at is not None:
+                end = job.finished_at
+            elif job.status == JobStatus.running:
+                end = self.clock.now
+            else:
+                continue
+            duration = max(0, min(end, self.clock.now) - max(job.started_at, cutoff))
+            if duration:
+                usage[job.team] = (
+                    usage.get(job.team, 0.0) + job.gpus * duration
+                )
         return usage
