@@ -1,0 +1,85 @@
+{
+  "cleaning": {
+    "duplicate_rows": 14,
+    "outlier_rows": 8,
+    "rejected_gpus": 2
+  },
+  "cost": {
+    "idle_cost": 1331.18,
+    "idle_percent": 37.18,
+    "platform_cost": 21.43,
+    "teams": {
+      "forecast": {
+        "direct_cost": 181.8,
+        "gpu_hours": 166.7253,
+        "idle_cost": 194.52,
+        "total_cost": 376.32
+      },
+      "nlp": {
+        "direct_cost": 395.82,
+        "gpu_hours": 365.65,
+        "idle_cost": 276.0,
+        "total_cost": 671.82
+      },
+      "platform": {
+        "direct_cost": 206.66,
+        "gpu_hours": 192.85,
+        "idle_cost": 413.47,
+        "total_cost": 620.13
+      },
+      "speech": {
+        "direct_cost": 1049.91,
+        "gpu_hours": 985.6,
+        "idle_cost": 146.68,
+        "total_cost": 1196.59
+      },
+      "vision": {
+        "direct_cost": 414.97,
+        "gpu_hours": 381.4167,
+        "idle_cost": 279.08,
+        "total_cost": 694.05
+      }
+    },
+    "total_cost": 3580.34
+  },
+  "idle_timeout_minutes": 20,
+  "jobs_counted": 478,
+  "launch_failures": 77,
+  "max_queue_depth": 153,
+  "nodes_launched": 125,
+  "peak_nodes": 10,
+  "policy": "fair",
+  "seed": 42,
+  "wait_time": {
+    "forecast": {
+      "p50": 0.0,
+      "p90": 5.59,
+      "p99": 12.38,
+      "started_within_10m_percent": 98.41
+    },
+    "nlp": {
+      "p50": 1.31,
+      "p90": 11.67,
+      "p99": 26.43,
+      "started_within_10m_percent": 87.5
+    },
+    "platform": {
+      "p50": 0.0,
+      "p90": 26.8,
+      "p99": 61.77,
+      "started_within_10m_percent": 87.5
+    },
+    "speech": {
+      "p50": 4.9,
+      "p90": 27.71,
+      "p99": 59.42,
+      "started_within_10m_percent": 75.0
+    },
+    "vision": {
+      "p50": 25.13,
+      "p90": 76.8,
+      "p99": 84.02,
+      "started_within_10m_percent": 37.65
+    }
+  }
+}
