@@ -3,10 +3,16 @@
 Run the API with simulated time only:
 
 ```sh
-pip install -r requirements.txt
+python3.11 -m venv --clear .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 export ADMIN_TOKEN=dev-secret
-uvicorn api:app --reload
+python -m uvicorn api:app --reload
 ```
+
+Use Python 3.11. The pinned Pydantic/FastAPI dependency versions do not
+support Python 3.15. Using `python -m pip` and `python -m uvicorn` ensures
+the active virtual environment executes both commands.
 
 | Method | Path | Purpose |
 |---|---|---|
