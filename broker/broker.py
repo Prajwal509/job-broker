@@ -10,6 +10,7 @@ from .models import Job, JobStatus, Node, NodeState, Priority
 from .provider import CapacityUnavailable, FakeProvider
 from .scheduler import Scheduler
 from .store import Store
+from .billing import Billing
 
 event_logger = logging.getLogger("job_broker.events")
 
@@ -38,6 +39,11 @@ class BrokerConfig:
     seed: int = int(os.environ.get("SEED", "42"))
     fairness_policy: str = os.environ.get("FAIRNESS_POLICY", "fair")
     admin_token: str = os.environ.get("ADMIN_TOKEN", "")
+    daily_budget_usd: float | None = (
+        float(os.environ["DAILY_BUDGET_USD"])
+        if os.environ.get("DAILY_BUDGET_USD")
+        else None
+    )
 
 
 class Broker:
@@ -412,7 +418,10 @@ class Broker:
             if job.status == JobStatus.queued and job.team not in teams:
                 teams.append(job.team)
 
-        while self._alive_node_count() < self.config.max_nodes:
+        while (
+            self._alive_node_count() < self.config.max_nodes
+            and self._daily_budget_allows_launch()
+        ):
             launched = False
             for team in teams:
                 team_jobs = [
@@ -460,6 +469,23 @@ class Broker:
             node.state in (NodeState.launching, NodeState.ready)
             for node in self.nodes.values()
         )
+
+    def _daily_budget_allows_launch(self) -> bool:
+        if self.config.daily_budget_usd is None:
+            return True
+        day_start = self.clock.now - (self.clock.now % 86400)
+        cost = Billing(self.store).report(day_start, self.clock.now + 1, self.clock.now).total_cost
+        allowed = cost < self.config.daily_budget_usd
+        if not allowed:
+            event_logger.warning(
+                json.dumps({
+                    "time": self.clock.now,
+                    "job_id": None,
+                    "node_id": None,
+                    "event": "daily_budget_exceeded",
+                })
+            )
+        return allowed
 
     def _type_outside_backoff(self, node_type: str) -> str | None:
         first = self.NODE_TYPES.index(node_type)
