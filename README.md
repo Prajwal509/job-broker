@@ -119,3 +119,6 @@ notice that requeues the node's jobs at the front with their original submit tim
 - Claude: task analysis, prompt support, then a code review that found bugs
   (HTTP jobs never finished, non-deterministic replay, extra launches, launch
   decisions ignoring that a job needs one node) and the fixes and simplification.
+- Start time: 2026-11-24 ~22:30 IST  
+- Finish time: 2026-11-25 ~15:00 IST (review and fixes with Claude after the first push)   
+- Hours worked, including AI time: ~2.5 hours
