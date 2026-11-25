@@ -14,8 +14,9 @@ Roll out a new tag, wait for `/healthz` and `/readyz`, and keep the existing
 named volume attached. Roll back by starting the previous image tag against
 the same volume.
 
-SQLite schema changes are guarded by `meta.schema_version`. An image must stop
-if its supported schema is older than the database version.
+SQLite schema changes are guarded by `meta.schema_version`: an image refuses to
+start if the database schema is newer than it supports, so a rollback cannot
+silently corrupt data.
 
 Backup SQLite by stopping writes, copying `job-broker.db` plus `-wal` and
 `-shm`, or by taking an online SQLite backup with `sqlite3`. Restore by placing
@@ -29,7 +30,6 @@ all files on `/data` and starting the matching or newer compatible image.
 | `IDLE_TIMEOUT_MINUTES` | Ready idle reaper | 10 |
 | `FAIRNESS_POLICY` | `fair` or `fifo` | fair |
 | `SEED` | Deterministic provider RNG | 42 |
-| `DAILY_BUDGET_USD` | Optional simulated launch stop | unset |
 
 Next for production: move state from SQLite to Postgres, run workers behind a
 job queue, deploy on Kubernetes/ECS, and use a secrets manager for admin

@@ -11,8 +11,6 @@
 - Nodes at `MAX_NODES`: ticket after 1 hour.
 - Capacity outage: ticket after 30 minutes.
 
-The daily budget event is a loud warning and prevents new launches.
-
 ## First response
 
 **Provider outage**
@@ -22,7 +20,7 @@ The daily budget event is a loud warning and prevents new launches.
 3. Ticket capacity outage after 30 minutes.
 
 **Runaway cost**
-1. Set `DAILY_BUDGET_USD` or `MAX_NODES=0`, then restart.
+1. Set `MAX_NODES=0` (no new launches; the reaper still removes idle nodes), then restart.
 2. Check `/nodes` and `/cost`.
 3. Restore the prior safe configuration after confirming the idle reaper works.
 

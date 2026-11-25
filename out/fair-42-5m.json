@@ -5,81 +5,86 @@
     "rejected_gpus": 2
   },
   "cost": {
-    "idle_cost": 1172.43,
-    "idle_percent": 34.28,
-    "platform_cost": 17.71,
+    "idle_cost": 1125.05,
+    "idle_percent": 33.33,
     "teams": {
       "forecast": {
-        "direct_cost": 180.32,
-        "gpu_hours": 166.7356,
-        "idle_cost": 178.15,
-        "total_cost": 358.47
+        "direct_cost": 182.0,
+        "gpu_hours": 166.85,
+        "idle_cost": 169.36,
+        "total_cost": 351.36
       },
       "nlp": {
-        "direct_cost": 393.55,
+        "direct_cost": 397.95,
         "gpu_hours": 365.65,
-        "idle_cost": 186.73,
-        "total_cost": 580.28
+        "idle_cost": 209.54,
+        "total_cost": 607.49
       },
       "platform": {
-        "direct_cost": 208.79,
+        "direct_cost": 207.98,
         "gpu_hours": 192.85,
-        "idle_cost": 412.53,
-        "total_cost": 621.32
+        "idle_cost": 406.02,
+        "total_cost": 614.0
       },
       "speech": {
-        "direct_cost": 1050.41,
+        "direct_cost": 1049.97,
         "gpu_hours": 985.6,
-        "idle_cost": 77.04,
-        "total_cost": 1127.45
+        "idle_cost": 72.36,
+        "total_cost": 1122.33
       },
       "vision": {
-        "direct_cost": 414.28,
-        "gpu_hours": 381.4167,
-        "idle_cost": 300.27,
-        "total_cost": 714.55
+        "direct_cost": 412.86,
+        "gpu_hours": 381.42,
+        "idle_cost": 245.39,
+        "total_cost": 658.25
       }
     },
-    "total_cost": 3419.78
+    "total_cost": 3375.8,
+    "unattributed_cost": 22.37
   },
   "idle_timeout_minutes": 5,
-  "jobs_counted": 478,
-  "launch_failures": 85,
-  "max_queue_depth": 151,
-  "nodes_launched": 155,
+  "jobs": 478,
+  "launch_failures": 61,
+  "max_queue_depth": 155,
+  "nodes_launched": 167,
   "peak_nodes": 10,
   "policy": "fair",
   "seed": 42,
-  "wait_time": {
+  "wait_minutes": {
     "forecast": {
+      "jobs": 63,
       "p50": 0.0,
-      "p90": 9.11,
-      "p99": 56.37,
-      "started_within_10m_percent": 92.06
+      "p90": 7.2,
+      "p99": 13.42,
+      "started_within_10m_percent": 96.83
     },
     "nlp": {
-      "p50": 4.74,
-      "p90": 36.78,
-      "p99": 63.53,
-      "started_within_10m_percent": 82.5
+      "jobs": 80,
+      "p50": 5.05,
+      "p90": 17.61,
+      "p99": 35.45,
+      "started_within_10m_percent": 86.25
     },
     "platform": {
+      "jobs": 24,
       "p50": 0.0,
-      "p90": 6.34,
-      "p99": 17.21,
+      "p90": 7.16,
+      "p99": 25.57,
       "started_within_10m_percent": 95.83
     },
     "speech": {
-      "p50": 5.57,
-      "p90": 13.77,
-      "p99": 46.79,
-      "started_within_10m_percent": 87.5
+      "jobs": 56,
+      "p50": 5.22,
+      "p90": 7.88,
+      "p99": 34.93,
+      "started_within_10m_percent": 91.07
     },
     "vision": {
-      "p50": 35.02,
-      "p90": 108.82,
-      "p99": 125.03,
-      "started_within_10m_percent": 39.61
+      "jobs": 255,
+      "p50": 24.2,
+      "p90": 90.06,
+      "p99": 102.04,
+      "started_within_10m_percent": 44.31
     }
   }
 }

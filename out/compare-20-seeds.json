@@ -1,0 +1,63 @@
+{
+  "forecast:p50": {
+    "fair_lower_in_seeds": 0,
+    "fair_mean": 0.0,
+    "fifo_mean": 0.0
+  },
+  "forecast:p90": {
+    "fair_lower_in_seeds": 8,
+    "fair_mean": 8.39,
+    "fifo_mean": 8.47
+  },
+  "idle_percent": {
+    "fair_lower_in_seeds": 9,
+    "fair_mean": 34.57,
+    "fifo_mean": 34.02
+  },
+  "nlp:p50": {
+    "fair_lower_in_seeds": 7,
+    "fair_mean": 4.28,
+    "fifo_mean": 4.29
+  },
+  "nlp:p90": {
+    "fair_lower_in_seeds": 8,
+    "fair_mean": 12.5,
+    "fifo_mean": 12.21
+  },
+  "platform:p50": {
+    "fair_lower_in_seeds": 2,
+    "fair_mean": 0.0,
+    "fifo_mean": 0.13
+  },
+  "platform:p90": {
+    "fair_lower_in_seeds": 14,
+    "fair_mean": 20.61,
+    "fifo_mean": 47.37
+  },
+  "seeds": 20,
+  "speech:p50": {
+    "fair_lower_in_seeds": 3,
+    "fair_mean": 5.77,
+    "fifo_mean": 5.67
+  },
+  "speech:p90": {
+    "fair_lower_in_seeds": 2,
+    "fair_mean": 23.06,
+    "fifo_mean": 21.18
+  },
+  "total_cost": {
+    "fair_lower_in_seeds": 9,
+    "fair_mean": 3442.05,
+    "fifo_mean": 3415.68
+  },
+  "vision:p50": {
+    "fair_lower_in_seeds": 7,
+    "fair_mean": 33.06,
+    "fifo_mean": 33.48
+  },
+  "vision:p90": {
+    "fair_lower_in_seeds": 1,
+    "fair_mean": 103.97,
+    "fifo_mean": 94.92
+  }
+}
