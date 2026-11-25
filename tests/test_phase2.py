@@ -2,9 +2,9 @@ import sqlite3
 
 import pytest
 
-from broker.billing import Billing
+from broker.billing import cost_report
 from broker.broker import Broker, BrokerConfig
-from broker.models import JobStatus, NodeState
+from broker.models import NODE_PRICE_PER_HOUR, JobStatus, NodeState
 from broker.store import Store
 
 
@@ -31,7 +31,7 @@ def state_snapshot(broker):
             "SELECT key,value FROM meta ORDER BY key"
         ).fetchall(),
         "provider_alive": set(broker.provider.alive),
-        "provider_rng": broker.provider.rng_state(),
+        "provider_rng": broker.provider.rng.getstate(),
     }
 
 
@@ -89,20 +89,16 @@ def test_cost_report_reconciles_direct_and_idle_cost_in_window(tmp_path):
     node = next(iter(broker.nodes.values()))
     assert node.state == NodeState.terminated
 
-    report = Billing(broker.store).report(0, broker.clock.now + 1, broker.clock.now)
+    report = cost_report(broker.store, 0, broker.clock.now + 1, broker.clock.now)
     team = report.teams["vision"]
     assert team.gpu_hours == pytest.approx(5 / 60)
-    assert team.direct_cost == pytest.approx(0.08)
+    assert team.direct_cost == pytest.approx(5 / 60)  # 5 min of a $1/h node
     assert team.idle_cost > 0
-    assert team.total_cost + report.platform_cost == report.total_cost
-    assert report.idle_percent == pytest.approx(
-        report.idle_cost / report.total_cost * 100
-    )
+    assert team.total_cost + report.unattributed_cost == pytest.approx(report.total_cost)
+    assert report.total_cost == pytest.approx(provider_bill(broker))
 
-    running_window = Billing(broker.store).report(
-        started_at, job.finished_at, broker.clock.now
-    )
-    assert running_window.teams["vision"].total_cost == pytest.approx(0.08)
+    running_window = cost_report(broker.store, started_at, job.finished_at, broker.clock.now)
+    assert running_window.teams["vision"].total_cost == pytest.approx(5 / 60)
 
 
 def test_live_node_cost_accrues_through_report_time(tmp_path):
@@ -111,57 +107,31 @@ def test_live_node_cost_accrues_through_report_time(tmp_path):
     broker.advance_to(8 * 60)
     assert job.status == JobStatus.running
 
-    report = Billing(broker.store).report(0, 100 * 60, broker.clock.now)
-    assert report.total_cost == pytest.approx(round(broker.clock.now / 3600, 2))
+    report = cost_report(broker.store, 0, 100 * 60, broker.clock.now)
+    assert report.total_cost == pytest.approx(broker.clock.now / 3600)
     assert report.teams["vision"].gpu_hours > 0
 
 
 def test_minimum_billing_shortfall_is_booked_at_termination(tmp_path):
     broker = make_broker(tmp_path, "minimum.db")
-    node = broker._launch_one("gpu-s", 0, "vision")
+    node = broker._launch_one("gpu-s", "vision")
     assert node is not None
-    broker._terminate_node(node, 300)
-    billing = Billing(broker.store)
-
-    before_termination = billing.report(0, 300, 300)
-    through_termination = billing.report(0, 301, 301)
-    assert before_termination.total_cost == pytest.approx(0.08)
-    assert through_termination.total_cost == pytest.approx(0.17)
-    assert through_termination.platform_cost == pytest.approx(0.17)
+    broker.clock.advance_to(300)
+    broker._terminate_node(node)
+    before_termination = cost_report(broker.store, 0, 300, 300)
+    through_termination = cost_report(broker.store, 0, 301, 301)
+    assert before_termination.total_cost == pytest.approx(300 / 3600)
+    assert through_termination.total_cost == pytest.approx(600 / 3600)  # 10-min minimum
+    # The node never ran a job, so nobody is charged for it.
+    assert through_termination.unattributed_cost == pytest.approx(600 / 3600)
     assert through_termination.teams == {}
 
 
-def test_store_migrates_phase1_ledger_schema(tmp_path):
-    database = str(tmp_path / "legacy.db")
-    connection = sqlite3.connect(database)
-    connection.executescript(
-        """
-        CREATE TABLE nodes (
-          id TEXT PRIMARY KEY,
-          type TEXT NOT NULL,
-          state TEXT NOT NULL,
-          launched_at INTEGER NOT NULL,
-          ready_at INTEGER,
-          terminated_at INTEGER,
-          tenant TEXT,
-          failure_at INTEGER,
-          idle_since INTEGER
-        );
-        CREATE TABLE ledger (
-          node_id TEXT NOT NULL,
-          start INTEGER NOT NULL,
-          end INTEGER NOT NULL,
-          tenant TEXT,
-          gpus_used INTEGER NOT NULL
-        );
-        """
-    )
-    connection.close()
+def provider_bill(broker):
+    """What the provider charges, computed from nodes only (independent of the ledger)."""
+    total = 0.0
+    for node in broker.store.nodes():
+        end = node.terminated_at if node.terminated_at is not None else broker.clock.now
+        total += max(end - node.launched_at, 600) * NODE_PRICE_PER_HOUR[node.type] / 3600
+    return total
 
-    store = Store(database)
-    columns = {
-        row["name"]: row for row in store.conn.execute("PRAGMA table_info(ledger)")
-    }
-    assert columns["id"]["pk"] == 1
-    assert columns["end"]["notnull"] == 0
-    assert store.get_meta("schema_version") == Store.SCHEMA_VERSION

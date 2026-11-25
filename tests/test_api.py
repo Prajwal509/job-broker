@@ -139,8 +139,8 @@ def test_metrics_count_never_ready_launches(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         broker.provider,
-        "launch_details",
-        lambda node_id, _node_type, now: ProviderLaunch(node_id, None, now + 900),
+        "launch_node",
+        lambda _node_type, now: ProviderLaunch("node-1", None, now + 900),
     )
     client.post("/jobs", json=job_body())
     advanced = client.post(
@@ -151,3 +151,28 @@ def test_metrics_count_never_ready_launches(tmp_path, monkeypatch):
 
     assert advanced.status_code == 200
     assert "launch_failures_total 1\n" in client.get("/metrics").text
+
+
+def test_complete_endpoint_finishes_running_job(tmp_path):
+    client, broker = make_client(tmp_path)
+    monkeypatch_ready = ProviderLaunch("node-1", 240, None)
+    broker.provider.launch_node = lambda _node_type, _now: monkeypatch_ready
+    job = client.post("/jobs", json=job_body()).json()
+    assert client.post(f"/jobs/{job['id']}/complete").status_code == 409  # still queued
+
+    client.post("/admin/advance", json={"minutes": 4}, headers={"X-Admin-Token": "test-token"})
+    assert client.get(f"/jobs/{job['id']}").json()["status"] == "running"
+    done = client.post(f"/jobs/{job['id']}/complete", json={"outcome": "failed"})
+    assert done.status_code == 200
+    assert done.json()["status"] == "failed"
+    assert client.post(f"/jobs/{job['id']}/complete").status_code == 409
+    nodes = client.get("/nodes").json()
+    assert nodes[0]["free_gpus"] == 1 and nodes[0]["idle_since"] == 240
+
+
+def test_advance_is_capped(tmp_path):
+    client, _broker = make_client(tmp_path)
+    response = client.post(
+        "/admin/advance", json={"minutes": 10**9}, headers={"X-Admin-Token": "test-token"}
+    )
+    assert response.status_code == 422

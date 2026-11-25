@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from broker.trace import clean_trace, replay_trace
 
 
@@ -21,20 +23,20 @@ def test_clean_trace_normalizes_sorts_and_deduplicates(tmp_path):
     ]
     assert report.duplicate_rows == 1
     assert len(report.rejected_gpus) == 1
-    assert report.duplicate_rows == 1
 
 
-def test_replay_trace_cost_invariant_and_output_shape(tmp_path):
-    trace = Path("data/01a_trace.csv")
-    db = tmp_path / "fair.db"
+def test_replay_is_deterministic_and_costs_add_up(tmp_path):
+    cleaning = clean_trace(Path("data/01a_trace.csv"))
 
-    result = replay_trace(trace, "fair", 42, db, idle_timeout_minutes=10)
+    first = replay_trace(cleaning, "fair", 42, tmp_path / "a.db")
+    second = replay_trace(cleaning, "fair", 42, tmp_path / "b.db")
 
-    assert result["jobs_counted"] > 0
-    assert result["peak_nodes"] >= 1
-    assert result["cost"]["total_cost"] >= 0
-    assert (
-        round(sum(team["total_cost"] for team in result["cost"]["teams"].values())
-              + result["cost"]["platform_cost"], 2)
-        == result["cost"]["total_cost"]
+    assert first == second
+    assert first["jobs"] == len(cleaning.rows)
+    assert 1 <= first["peak_nodes"] <= 10
+    cost = first["cost"]
+    teams_total = sum(team["total_cost"] for team in cost["teams"].values())
+    # Each figure is rounded to cents on its own, so allow one cent per figure.
+    assert teams_total + cost["unattributed_cost"] == pytest.approx(
+        cost["total_cost"], abs=0.01 * (len(cost["teams"]) + 1)
     )

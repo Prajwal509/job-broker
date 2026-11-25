@@ -7,9 +7,8 @@ from broker.broker import (
     IllegalTransitionError,
     ValidationError,
 )
-from broker.models import JobStatus, NodeState
-from broker.provider import CapacityUnavailable
-from broker.provider import FakeProvider
+from broker.models import NODE_GPUS, JobStatus, NodeState
+from broker.provider import CapacityUnavailable, FakeProvider
 from broker.scheduler import Scheduler
 from broker.models import Job, Priority
 from broker.store import Store
@@ -69,11 +68,7 @@ def test_cancel_running_frees_gpu(tmp_path):
     assert job.status == JobStatus.running
     broker.cancel(job.id)
     node = broker.nodes[job.node_id] if job.node_id else next(iter(broker.nodes.values()))
-    assert broker._free_gpus(node) == node_capacity(node)
-
-
-def node_capacity(node):
-    return {"gpu-s": 1, "gpu-m": 4, "gpu-l": 8}[node.type]
+    assert broker.free_gpus(node) == NODE_GPUS[node.type]
 
 
 def test_best_fit_placement(tmp_path):
@@ -155,25 +150,17 @@ def test_tenant_isolation(tmp_path):
 def test_capacity_outage_resilience(tmp_path):
     broker = make_broker(tmp_path)
 
-    class FailingProvider:
-        launch_failures = 0
-
-        def set_clock(self, clock):
-            pass
-
+    class FailingProvider(FakeProvider):
         def launch_node(self, node_type, now):
-            self.launch_failures += 1
             raise CapacityUnavailable("outage")
-
-        def terminate_node(self, node_id):
-            pass
 
     broker.provider = FailingProvider()
     job = broker.submit("vision", 1, 30, "normal", "job")
     assert job.status == JobStatus.queued
     broker.advance_to(30 * 60)
     assert job.status == JobStatus.queued
-    assert broker.provider.launch_failures >= 1
+    assert broker.launch_failures >= 2  # retried with backoff, never gave up
+    assert broker.backoff["gpu-s"]["failures"] >= 2
 
 
 def test_launch_failure_and_reaper(tmp_path):
@@ -212,16 +199,18 @@ def test_never_ready_launch_has_no_ready_time():
     provider = FakeProvider()
 
     class ForcedFailureRng:
+        values = iter((0.5, 0.0))  # no outage, then "never ready"
+
         def randint(self, _start, _end):
             return 4 * 60
 
         def random(self):
-            return 0.0
+            return next(self.values)
 
     provider.rng = ForcedFailureRng()
-    details = provider.launch_details("node-1", "gpu-s", 100)
-    assert details.ready_at is None
-    assert details.failure_at == 100 + 15 * 60
+    launch = provider.launch_node("gpu-s", 100)
+    assert launch.ready_at is None
+    assert launch.failure_at == 100 + 15 * 60
 
 
 def test_node_ids_are_monotonic_and_terminated_rows_are_preserved(tmp_path):
@@ -238,11 +227,12 @@ def test_node_ids_are_monotonic_and_terminated_rows_are_preserved(tmp_path):
             return start
 
     broker.provider.rng = ReliableRng()
-    first = broker._launch_one("gpu-s", 0)
+    first = broker._launch_one("gpu-s")
     assert first is not None
-    broker._terminate_node(first, 1)
+    broker.clock.advance_to(1)
+    broker._terminate_node(first)
 
-    second = broker._launch_one("gpu-s", 1)
+    second = broker._launch_one("gpu-s")
     assert second is not None
     assert second.id != first.id
     assert broker.store.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0] == 2
@@ -253,7 +243,7 @@ def test_node_ids_are_monotonic_and_terminated_rows_are_preserved(tmp_path):
     store = Store(broker.config.db_path)
     restarted = Broker(store=store, config=broker.config)
     restarted.provider.rng = ReliableRng()
-    third = restarted._launch_one("gpu-s", 2)
+    third = restarted._launch_one("gpu-s")
     assert third is not None
     assert third.id not in {first.id, second.id}
 
@@ -311,19 +301,12 @@ def test_empty_node_is_reused_by_another_team(tmp_path):
 def test_due_launch_retry_is_dropped_when_queue_is_empty(tmp_path):
     broker = make_broker(tmp_path)
 
-    class CountingFailureProvider:
-        launch_failures = 0
+    class CountingFailureProvider(FakeProvider):
         calls = 0
-
-        def set_clock(self, _clock):
-            pass
 
         def launch_node(self, _node_type, _now):
             self.calls += 1
             raise CapacityUnavailable("outage")
-
-        def terminate_node(self, _node_id):
-            pass
 
     broker.provider = CountingFailureProvider()
     job = broker.submit("vision", 1, 30, "normal", "job")
@@ -357,7 +340,7 @@ def test_large_team_queue_launches_for_uncovered_demand(tmp_path):
         if node.state in (NodeState.launching, NodeState.ready)
     ]
     assert 2 <= len(alive_nodes) <= broker.config.max_nodes
-    assert sum(broker.NODE_GPUS[node.type] for node in alive_nodes) >= 40
+    assert sum(NODE_GPUS[node.type] for node in alive_nodes) >= 40
 
 
 def test_fair_queue_round_robins_teams():
@@ -409,3 +392,65 @@ def test_illegal_transition(tmp_path):
         pass
     else:
         raise AssertionError("queued job cannot finish")
+
+
+class ReliableRng(random.Random):
+    """No outages, every node ready after exactly 4 minutes."""
+
+    def __init__(self):
+        super().__init__(0)
+
+    def random(self):
+        return 0.5
+
+    def randint(self, start, _end):
+        return start
+
+
+def test_completion_is_reported_by_a_call(tmp_path):
+    broker = make_broker(tmp_path)
+    broker.provider.rng = ReliableRng()
+    job = broker.submit("vision", 1, 30, "normal", "api-job")  # no actual_minutes
+    broker.advance_to(4 * 60)
+    assert job.status == JobStatus.running
+    node = broker.nodes[job.node_id]
+
+    broker.finish_job(job.id, "failed")
+    assert job.status == JobStatus.failed
+    assert node.idle_since == broker.clock.now
+    broker.advance_to(broker.clock.now + 11 * 60)
+    assert node.state == NodeState.terminated
+
+
+def test_booting_node_stays_reserved_for_the_team_that_launched_it(tmp_path):
+    broker = make_broker(tmp_path)
+    broker.provider.rng = ReliableRng()
+    alpha = broker.submit("alpha", 1, 30, "normal", "a", actual_minutes=30)
+    broker.advance_to(60)
+    beta = broker.submit("beta", 1, 30, "high", "b", actual_minutes=30)
+    assert len(broker.nodes) == 2
+
+    broker.advance_to(4 * 60)  # alpha's node is ready; beta's is still booting
+    assert alpha.status == JobStatus.running
+    assert beta.status == JobStatus.queued
+    broker.advance_to(5 * 60)
+    assert beta.status == JobStatus.running
+    assert len(broker.nodes) == 2  # no extra launch
+
+
+def test_job_must_fit_on_one_node_when_deciding_to_launch(tmp_path):
+    broker = make_broker(tmp_path)
+    broker.provider.rng = ReliableRng()
+    first = broker.submit("t", 4, 10, "normal", "m0", actual_minutes=10)
+    broker.advance_to(4 * 60)
+    broker.submit("t", 4, 10, "normal", "m1", actual_minutes=10)
+    broker.advance_to(first.ends_at + 5 * 60)
+    idle = [n for n in broker.nodes.values() if n.state == NodeState.ready]
+    assert [n.type for n in idle] == ["gpu-m", "gpu-m"]
+    assert all(broker.free_gpus(n) == 4 for n in idle)
+
+    big = broker.submit("t", 8, 10, "normal", "big", actual_minutes=10)
+    booting = [n for n in broker.nodes.values() if n.state == NodeState.launching]
+    assert [n.type for n in booting] == ["gpu-l"]  # 4 + 4 free does not fit 8
+    broker.advance_to(broker.clock.now + 4 * 60)
+    assert big.status == JobStatus.running
