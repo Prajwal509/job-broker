@@ -119,6 +119,3 @@ notice that requeues the node's jobs at the front with their original submit tim
 - Claude: task analysis, prompt support, then a code review that found bugs
   (HTTP jobs never finished, non-deterministic replay, extra launches, launch
   decisions ignoring that a job needs one node) and the fixes and simplification.
-- Start time: TBD
-- Finish time: TBD
-- Hours worked, including AI time: TBD
